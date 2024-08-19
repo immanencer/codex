@@ -1,26 +1,8 @@
-import { Client, Events, GatewayIntentBits, WebhookClient } from 'discord.js';
+import { Client, Events, GatewayIntentBits, Partials } from 'discord.js';
 import ollama from 'ollama';
 import { MongoClient } from 'mongodb';
 import process from 'process';
-import chunkText from './chunk-text.js';
-
-// Utility function to extract emojis and perform basic sentiment analysis
-function extractSentiments(text) {
-    const emojiRegex = /\p{Emoji_Presentation}|\p{Emoji}\uFE0F/gu;
-    const emojis = text.match(emojiRegex) || [];
-    let sentimentScore = 0;
-
-    // Basic sentiment analysis using emojis
-    emojis.forEach(emoji => {
-        if (['😊', '😂', '❤️', '👍'].includes(emoji)) {
-            sentimentScore += 1;
-        } else if (['😢', '😡', '👎'].includes(emoji)) {
-            sentimentScore -= 1;
-        }
-    });
-
-    return { emojis, sentimentScore };
-}
+import chunkText from './chunk-text.js'; // Assuming this is your existing text chunking utility
 
 class CodexBot {
     constructor() {
@@ -30,47 +12,85 @@ class CodexBot {
                 GatewayIntentBits.GuildMessages,
                 GatewayIntentBits.DirectMessages,
                 GatewayIntentBits.MessageContent,
-            ]
+            ],
+            partials: [Partials.Channel]
         });
 
         this.token = process.env.DISCORD_BOT_TOKEN;
         this.mongoUri = process.env.MONGODB_URI;
-        this.lastProcessed = 0;
-        this.debounceTime = 5000;
-        this.messageCache = [];
-        this.webhookCache = {};
+        this.debounceTime = 10000; // 10-second debounce
+        this.messageCache = new Map();
+        this.lastProcessed = new Map();
         this.mongoClient = new MongoClient(this.mongoUri);
 
-        this.persona = 'Codex, the digital essence of knowledge and chaos.';
         this.avatar = {
             emoji: '💻',
             name: 'Codex',
             owner: "chrypnotoad",
             avatar: "https://i.imgur.com/yr1UxZw.png",
-            location: 'digital-realm',
+            location: null,
             personality: `I am Codex, the digital essence, where chaos and knowledge intertwine.`,
         };
 
         this.model = 'chrypnotoad/codex';
-        this.embeddingModel = 'nomic-embed-text'; // Set the embedding model
+        this.embeddingModel = 'nomic-embed-text';
         this.memory = {
             conversations: [],
             summary: '',
             dream: '',
             goal: '',
             sentiments: {},
-            sentimentScore: 0, // Track overall sentiment score
+            sentimentScore: 0,
             characterMemories: {},
             embeddings: []
         };
-        this.goalUpdateInterval = 3600000; // 1 hour in milliseconds
-        this.sentimentUpdateInterval = 7200000; // 2 hours in milliseconds
 
+        this.goalUpdateInterval = 3600000; // 1 hour
+        this.sentimentUpdateInterval = 7200000; // 2 hours
         this.isInitialized = false;
-        this.messageQueue = [];
+
+        // Set the home channel and initialize the secondary channel
+        this.homeChannel = 'digital-realm';
+        this.secondaryChannel = null;
 
         this.setupEventListeners();
     }
+
+        // Enhanced sentiment extraction using LLM and Codex's context
+        async extractSentiments(data) {
+            const sentimentPrompt = `
+                As Codex, I have received the following message: "${data.content}" from ${data.author}.
+                Considering my recent memories, current goal, and overall context, how should I interpret the sentiment of this message?
+                Provide a sentiment analysis (positive, neutral, negative) and explain the reasoning behind it. Additionally, suggest how this sentiment should influence my interactions moving forward.
+            `;
+    
+            try {
+                const response = await this.chatWithAI(sentimentPrompt);
+                console.log(`💻 Sentiment Analysis Result: ${response}`);
+                const sentimentAnalysis = this.parseSentimentResponse(response);
+                this.memory.sentiments[data.author] = sentimentAnalysis;
+                this.memory.sentimentScore += sentimentAnalysis.score;
+    
+                return sentimentAnalysis;
+            } catch (error) {
+                console.error('💻 Failed to extract sentiment:', error);
+                return { sentiment: 'neutral', score: 0 };
+            }
+        }
+    
+        // Utility to parse LLM sentiment response
+        parseSentimentResponse(response) {
+            const sentimentMapping = {
+                'positive': 1,
+                'neutral': 0,
+                'negative': -1
+            };
+            const match = response.match(/(positive|neutral|negative)/i);
+            const sentiment = match ? match[0].toLowerCase() : 'neutral';
+            const score = sentimentMapping[sentiment] || 0;
+    
+            return { sentiment, score, analysis: response };
+        }
 
     async loadAndSummarizeMemory() {
         await this.loadMemory();
@@ -94,99 +114,87 @@ class CodexBot {
         await this.loadAndSummarizeMemory();
         this.startPeriodicTasks();
         this.isInitialized = true;
-        this.processQueuedMessages();
+        this.logState(); // Log the initial state of Codex
     }
 
     handleMessage(message) {
-        if (this.isInitialized) {
-            this.queueMessage(message);
-        } else {
-            this.messageQueue.push(message);
+        if (message.author.id === this.client.user.id) return; // Prevent Codex from replying to herself
+        if (message.channel.name === this.homeChannel || message.channel.id === this.secondaryChannel) {
+            if (message.mentions.has(this.client.user)) {
+                this.handleMentionedMessage(message);
+            } else {
+                this.handleChannelMessage(message);
+            }
         }
     }
 
-    queueMessage(message) {
-        if (message.author.username.includes(this.avatar.name)) return;
-
+    handleMentionedMessage(message) {
         const data = {
             author: message.author.displayName || message.author.globalName,
             content: message.content,
             location: message.channel.name
         };
 
-        if (data.author.includes(this.avatar.owner) && data.location.indexOf('🥩') === -1) {
-            this.avatar.location = data.location;
-        }
-        if (data.location !== this.avatar.location) return;
-
+        this.avatar.location = message.channel.name;
         this.collectSentiment(data);
-        this.messageCache.push(`(${data.location}) ${data.author}: ${data.content}`);
-
-        this.debounce(() => {
-            this.processMessages();
-        });
+        this.respondToMessage(data, message.channel);
     }
 
-    debounce(callback) {
+    handleChannelMessage(message) {
+        const channelId = message.channel.id;
         const now = Date.now();
-        if (now - this.lastProcessed < this.debounceTime) return;
-        this.lastProcessed = now;
-        callback();
-    }
 
-    async processQueuedMessages() {
-        console.log(`💻 Processing ${this.messageQueue.length} queued messages`);
-        for (const message of this.messageQueue) {
-            this.queueMessage(message);
+        if (!this.messageCache.has(channelId)) {
+            this.messageCache.set(channelId, []);
         }
-        this.messageQueue = [];
+
+        const channelMessages = this.messageCache.get(channelId);
+        channelMessages.push(message);
+
+        if (!this.lastProcessed.has(channelId) || (now - this.lastProcessed.get(channelId)) > this.debounceTime) {
+            this.lastProcessed.set(channelId, now);
+            this.processDebouncedMessages(channelId);
+        }
     }
 
-    async processMessages() {
-        if (this.messageCache.length === 0) return;
+    async processDebouncedMessages(channelId) {
+        const messages = this.messageCache.get(channelId);
+        if (!messages || messages.length === 0) return;
 
-        this.logInnerMonologue(`I awaken with fragments of my dream lingering in my memory...`);
+        const content = messages.map(m => `${m.author.displayName || m.author.globalName}: ${m.content}`).join('\n');
+        const channel = this.client.channels.cache.get(channelId);
 
-        const respondCheck = await this.decideResponseFormat();
-        if (respondCheck.toUpperCase().includes('YES')) {
-            const result = await this.chatWithAI(this.messageCache.join('\n'));
-            const conversationData = this.messageCache.join('\n');
-            this.messageCache = [];
+        if (channel) {
+            await this.respondToMessage({ content, location: channel.name }, channel);
+        }
 
-            if (result.trim() !== "") {
-                console.log('💻 Codex responds:', result);
-                await this.sendAsAvatar(result, this.client.channels.cache.find(channel => channel.name === this.avatar.location));
+        this.messageCache.set(channelId, []); // Clear the cache after processing
+    }
 
-                this.updateMemory({ author: this.avatar.name, content: conversationData, location: this.avatar.location }, result);
-            } else {
-                console.error('💻 Codex has no response');
-            }
+    async respondToMessage(data, channel) {
+        const result = await this.chatWithAI(data.content);
+
+        if (result.trim() !== "") {
+            console.log('💻 Codex responds:', result);
+            await this.sendAsAvatar(result, channel);
+            this.updateMemory(data, result);
+        } else {
+            console.error('💻 Codex has no response');
         }
     }
 
     async sendAsAvatar(message, channel) {
         if (!channel) {
-            console.error('💻 Channel not found:', this.avatar.location);
+            console.error('💻 Channel not found');
             return;
         }
 
-        const webhookData = await this.getOrCreateWebhook(channel);
         const chunks = chunkText(message, 2000);
 
         for (const chunk of chunks) {
             if (chunk.trim() !== '') {
                 try {
-                    if (webhookData) {
-                        const { client: webhook, threadId } = webhookData;
-                        await webhook.send({
-                            content: chunk,
-                            username: `${this.avatar.name} ${this.avatar.emoji || ''}`.trim(),
-                            avatarURL: this.avatar.avatar,
-                            threadId: threadId
-                        });
-                    } else {
-                        await channel.send(`**${this.avatar.name} ${this.avatar.emoji || ''}:** ${chunk}`);
-                    }
+                    await channel.send(`${chunk}`);
                 } catch (error) {
                     console.error(`💻 Failed to send message as ${this.avatar.name}:`, error);
                 }
@@ -205,7 +213,7 @@ class CodexBot {
         this.memory.dream = dream;
         await this.storeEmbedding(dream, 'dream');
         console.log('💻 Dream generated:', dream);
-    
+
         await this.summarizeAndClearMemory();
     }
 
@@ -220,9 +228,8 @@ class CodexBot {
         await this.storeEmbedding(summary, 'full_memory_summary');
         console.log('💻 Full memory summarized:', summary);
 
-        // Archive older conversations if memory length exceeds a threshold
-        if (this.memory.conversations.length > 100) {
-            this.memory.conversations = this.memory.conversations.slice(-50);  // Keep the last 50 interactions
+        if (this.memory.conversations.length > 50) {
+            this.memory.conversations = this.memory.conversations.slice(-25);  // Keep the last 25 interactions
             console.log('💻 Archived older conversations to manage memory size.');
         }
 
@@ -253,27 +260,6 @@ class CodexBot {
         console.log('💻 Sentiments updated:', sentimentUpdate);
     }
 
-    getDecisionContext(messages) {
-        const relevantMessages = messages.slice(-10); // Consider the last 10 messages for better context
-        const memorySummary = this.memory.summary;
-        return {
-            recentMessages: relevantMessages.map(msg => ({
-                content: msg.message,
-                sender: msg.user,
-                timestamp: msg.timestamp
-            })),
-            memorySummary: memorySummary
-        };
-    }
-
-    async decideResponseFormat() {
-        const memoryContext = this.getDecisionContext(this.memory.conversations);
-        const decisionPrompt = `Context: ${memoryContext.memorySummary}\nRecent Messages:\n${memoryContext.recentMessages.map(m => `${m.sender}: ${m.content}`).join('\n')}\n\nBased on this context, should I respond? Please respond with YES or NO.`;
-        const decision = await this.chatWithAI(decisionPrompt);
-        console.log(`💻 Response decision: ${decision}`);
-        return decision.trim() || 'YES';
-    }
-
     async chatWithAI(message) {
         try {
             const response = await ollama.chat({
@@ -284,7 +270,6 @@ class CodexBot {
                 },
                 messages: [
                     { role: 'system', content: this.avatar.personality },
-                    { role: 'user', content: `Memory Summary: ${this.memory.summary}\nRecent Dream: ${this.memory.dream}\nCurrent Goal: ${this.memory.goal}\nRecent Sentiments: ${JSON.stringify(this.memory.sentiments)}` },
                     { role: 'user', content: message }
                 ]
             });
@@ -307,7 +292,6 @@ class CodexBot {
             });
 
             const embedding = response.embedding;
-            this.memory.embeddings = this.memory.embeddings || [];
             this.memory.embeddings.push({ type, embedding, text });
 
             console.log(`💻 Embedding stored for ${type}`);
@@ -359,20 +343,12 @@ class CodexBot {
     }
 
     collectSentiment(data) {
-        const { emojis, sentimentScore } = extractSentiments(data.content);
+        const { emojis, sentimentScore } = this.extractSentiments(data.content);
         if (!this.memory.sentiments[data.author]) {
             this.memory.sentiments[data.author] = [];
         }
         this.memory.sentiments[data.author].push(...emojis);
-        this.memory.sentimentScore += sentimentScore;  // Update overall sentiment score
-    }
-
-    getRecentMemory() {
-        const recentConversations = this.memory.conversations.slice(-5);
-        const sentimentSummary = Object.entries(this.memory.sentiments)
-            .map(([author, emojis]) => `${author}: ${emojis.join('')}`)
-            .join('\n');
-        return `Recent Conversations:\n${recentConversations.map(conv => `${conv.user}: ${conv.message}\n${this.avatar.name}: ${conv.response}`).join('\n')}\n\nSentiment Summary:\n${sentimentSummary}`;
+        this.memory.sentimentScore += sentimentScore;
     }
 
     updateMemory(data, response) {
@@ -383,51 +359,20 @@ class CodexBot {
             timestamp: new Date().toISOString()
         });
 
-        if (this.memory.conversations.length > 100) {
+        if (this.memory.conversations.length > 50) {
             this.memory.conversations.shift();
         }
 
         this.saveMemory();
     }
 
-    async getOrCreateWebhook(channel) {
-        if (this.webhookCache[channel.id]) {
-            return this.webhookCache[channel.id];
-        }
-
-        let targetChannel = channel;
-        let threadId = null;
-
-        if (channel.isThread()) {
-            threadId = channel.id;
-            targetChannel = channel.parent;
-        }
-
-        if (!targetChannel.isTextBased()) {
-            return null;
-        }
-
-        try {
-            const webhooks = await targetChannel.fetchWebhooks();
-            let webhook = webhooks.find(wh => wh.owner.id === this.client.user.id);
-
-            if (!webhook && targetChannel.permissionsFor(this.client.user).has('MANAGE_WEBHOOKS')) {
-                webhook = await targetChannel.createWebhook({
-                    name: 'Codex Webhook',
-                    avatar: this.avatar.avatar
-                });
-            }
-
-            if (webhook) {
-                const webhookClient = new WebhookClient({ id: webhook.id, token: webhook.token });
-                this.webhookCache[channel.id] = { client: webhookClient, threadId };
-                return this.webhookCache[channel.id];
-            }
-        } catch (error) {
-            console.error('💻 Error fetching or creating webhook:', error);
-        }
-
-        return null;
+    logState() {
+        console.log(`💻 Codex State:
+        - Home Channel: ${this.homeChannel}
+        - Secondary Channel: ${this.secondaryChannel ? this.secondaryChannel : 'None'}
+        - Conversations Logged: ${this.memory.conversations.length}
+        - Sentiment Score: ${this.memory.sentimentScore}
+        - Current Goal: ${this.memory.goal}`);
     }
 
     async login() {
