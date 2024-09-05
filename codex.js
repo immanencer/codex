@@ -69,7 +69,7 @@ class CodexBot {
                 console.log(`💻 Sentiment Analysis Result: ${response}`);
                 const sentimentAnalysis = this.parseSentimentResponse(response);
                 this.memory.sentiments[data.author] = sentimentAnalysis;
-                this.memory.sentimentScore += sentimentAnalysis.score;
+                this.memory.sentimentScore = (this.memory.sentimentScore || 0) + sentimentAnalysis.score;
     
                 return sentimentAnalysis;
             } catch (error) {
@@ -143,37 +143,46 @@ class CodexBot {
     handleChannelMessage(message) {
         const channelId = message.channel.id;
         const now = Date.now();
-
+    
         if (!this.messageCache.has(channelId)) {
             this.messageCache.set(channelId, []);
         }
-
+    
         const channelMessages = this.messageCache.get(channelId);
-        channelMessages.push(message);
-
+        const messageData = {
+            username: message.author.displayName || message.author.globalName,
+            content: message.content
+        };
+        channelMessages.push(messageData);
+    
         if (!this.lastProcessed.has(channelId) || (now - this.lastProcessed.get(channelId)) > this.debounceTime) {
             this.lastProcessed.set(channelId, now);
             this.processDebouncedMessages(channelId);
         }
     }
+    
 
     async processDebouncedMessages(channelId) {
         const messages = this.messageCache.get(channelId);
         if (!messages || messages.length === 0) return;
-
-        const content = messages.map(m => `${m.author.displayName || m.author.globalName}: ${m.content}`).join('\n');
+    
+        const content = messages.map(m => `${m.username}: ${m.content}`).join('\n');
         const channel = this.client.channels.cache.get(channelId);
-
+    
+        // Log the full conversation context being sent to the AI
+        console.log('💻 Full conversation context being sent to AI:', content);
+    
         if (channel) {
             await this.respondToMessage({ content, location: channel.name }, channel);
         }
-
+    
         this.messageCache.set(channelId, []); // Clear the cache after processing
     }
-
+    
+    
     async respondToMessage(data, channel) {
         const result = await this.chatWithAI(data.content);
-
+    
         if (result.trim() !== "") {
             console.log('💻 Codex responds:', result);
             await this.sendAsAvatar(result, channel);
@@ -181,7 +190,7 @@ class CodexBot {
         } else {
             console.error('💻 Codex has no response');
         }
-    }
+    }    
 
     async sendAsAvatar(message, channel) {
         if (!channel) {
@@ -262,6 +271,7 @@ class CodexBot {
 
     async chatWithAI(message) {
         try {
+            console.log('🔮 Sending message to AI:', message);
             const response = await ollama.chat({
                 model: this.model,
                 embedding: {
@@ -273,12 +283,14 @@ class CodexBot {
                     { role: 'user', content: message }
                 ]
             });
+            console.log('🔮 AI response:', response.message.content);
             return response.message.content;
         } catch (error) {
             console.error('🔮 AI chat error:', error);
             return '';
         }
     }
+    
 
     logInnerMonologue(message) {
         console.log(`(codex-inner-monologue) self: ${message}`);
@@ -295,6 +307,7 @@ class CodexBot {
             this.memory.embeddings.push({ type, embedding, text });
 
             console.log(`💻 Embedding stored for ${type}`);
+            console.log('💬 Text:', text);
         } catch (error) {
             console.error(`💻 Failed to generate embedding for ${type}:`, error);
         }
@@ -320,7 +333,7 @@ class CodexBot {
             const data = await this.memoryCollection.findOne({ name: this.avatar.name });
             if (data) {
                 this.memory = data.memory;
-                console.log(`💻 Memory loaded for ${this.avatar.name}`);
+                console.log(`💻 Memory loaded for ${this.avatar.name}:`, this.memory);
             } else {
                 console.log(`💻 No existing memory found for ${this.avatar.name}. Starting with fresh memory.`);
             }
@@ -328,7 +341,7 @@ class CodexBot {
             console.error(`💻 Failed to load memory for ${this.avatar.name}:`, error);
         }
     }
-
+    
     async saveMemory() {
         try {
             await this.memoryCollection.updateOne(
@@ -336,11 +349,12 @@ class CodexBot {
                 { $set: { memory: this.memory } },
                 { upsert: true }
             );
-            console.log(`💻 Memory saved for ${this.avatar.name}`);
+            console.log(`💻 Memory saved for ${this.avatar.name}:`, this.memory);
         } catch (error) {
             console.error(`💻 Failed to save memory for ${this.avatar.name}:`, error);
         }
     }
+    
 
     collectSentiment(data) {
         const { emojis, sentimentScore } = this.extractSentiments(data.content);
@@ -352,19 +366,24 @@ class CodexBot {
     }
 
     updateMemory(data, response) {
-        this.memory.conversations.push({
+        const conversation = {
             user: data.author,
             message: data.content,
             response: response,
             timestamp: new Date().toISOString()
-        });
-
+        };
+    
+        console.log('💻 Updating memory with conversation:', conversation);
+    
+        this.memory.conversations.push(conversation);
+    
         if (this.memory.conversations.length > 50) {
             this.memory.conversations.shift();
         }
-
+    
         this.saveMemory();
     }
+    
 
     logState() {
         console.log(`💻 Codex State:
