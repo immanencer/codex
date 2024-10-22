@@ -258,7 +258,7 @@ class CodexBot {
         const summary = await this.chatWithAI(sentimentSummaryPrompt);
         this.memory.sentimentSummary = summary;
         await this.storeEmbedding(summary, 'sentiment_summary');
-        console.log('💻 Sentiment summarized:', summary);
+        console.log('💻 Sentiment summarized.');
     }
 
     async updateSentiments() {
@@ -307,7 +307,6 @@ class CodexBot {
             this.memory.embeddings.push({ type, embedding, text });
 
             console.log(`💻 Embedding stored for ${type}`);
-            console.log('💬 Text:', text);
         } catch (error) {
             console.error(`💻 Failed to generate embedding for ${type}:`, error);
         }
