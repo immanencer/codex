@@ -40,7 +40,6 @@ class CodexBot {
             dream: '',
             goal: '',
             sentiments: {},
-            sentimentScore: 0,
             characterMemories: {},
             embeddings: []
         };
@@ -56,41 +55,23 @@ class CodexBot {
         this.setupEventListeners();
     }
 
-        // Enhanced sentiment extraction using LLM and Codex's context
-        async extractSentiments(data) {
-            const sentimentPrompt = `
-                As Codex, I have received the following message: "${data.content}" from ${data.author}.
+    // Enhanced sentiment extraction using LLM and Codex's context
+    async extractSentiments(data) {
+        const sentimentPrompt = `
+                As Codex, I have received the following message: "${data}.
                 Considering my recent memories, current goal, and overall context, how should I interpret the sentiment of this message?
-                Provide a sentiment analysis (positive, neutral, negative) and explain the reasoning behind it. Additionally, suggest how this sentiment should influence my interactions moving forward.
+                Only respond with a series of emojis to represent the sentiment.
             `;
-    
-            try {
-                const response = await this.chatWithAI(sentimentPrompt);
-                console.log(`💻 Sentiment Analysis Result: ${response}`);
-                const sentimentAnalysis = this.parseSentimentResponse(response);
-                this.memory.sentiments[data.author] = sentimentAnalysis;
-                this.memory.sentimentScore = (this.memory.sentimentScore || 0) + sentimentAnalysis.score;
-    
-                return sentimentAnalysis;
-            } catch (error) {
-                console.error('💻 Failed to extract sentiment:', error);
-                return { sentiment: 'neutral', score: 0 };
-            }
+
+        try {
+            const response = await this.chatWithAI(sentimentPrompt);
+            console.log(`💻 Sentiment Analysis Result: ${response}`);
+            return (response.match(/[\uD83C-\uDBFF\uDC00-\uDFFF]{1,2}/gu) || []);
+        } catch (error) {
+            console.error('💻 Failed to extract sentiment:', error);
+            return { sentiment: 'neutral', score: 0 };
         }
-    
-        // Utility to parse LLM sentiment response
-        parseSentimentResponse(response) {
-            const sentimentMapping = {
-                'positive': 1,
-                'neutral': 0,
-                'negative': -1
-            };
-            const match = response.match(/(positive|neutral|negative)/i);
-            const sentiment = match ? match[0].toLowerCase() : 'neutral';
-            const score = sentimentMapping[sentiment] || 0;
-    
-            return { sentiment, score, analysis: response };
-        }
+    }
 
     async loadAndSummarizeMemory() {
         await this.loadMemory();
@@ -117,18 +98,18 @@ class CodexBot {
         this.logState(); // Log the initial state of Codex
     }
 
-    handleMessage(message) {
+    async handleMessage(message) {
         if (message.author.id === this.client.user.id) return; // Prevent Codex from replying to herself
-        if (message.channel.name === this.homeChannel || message.channel.id === this.secondaryChannel) {
-            if (message.mentions.has(this.client.user)) {
-                this.handleMentionedMessage(message);
-            } else {
-                this.handleChannelMessage(message);
-            }
+        if (message.mentions.has(this.client.user)) {
+            this.secondaryChannel = message.channel.name;
+            await this.handleMentionedMessage(message);
+        } else {
+            this.handleChannelMessage(message);
         }
+
     }
 
-    handleMentionedMessage(message) {
+    async handleMentionedMessage(message) {
         const data = {
             author: message.author.displayName || message.author.globalName,
             content: message.content,
@@ -136,53 +117,70 @@ class CodexBot {
         };
 
         this.avatar.location = message.channel.name;
-        this.collectSentiment(data);
+        await this.collectSentiment(data);
         this.respondToMessage(data, message.channel);
     }
 
     handleChannelMessage(message) {
         const channelId = message.channel.id;
         const now = Date.now();
-    
+
         if (!this.messageCache.has(channelId)) {
             this.messageCache.set(channelId, []);
         }
-    
+
         const channelMessages = this.messageCache.get(channelId);
         const messageData = {
             username: message.author.displayName || message.author.globalName,
             content: message.content
         };
         channelMessages.push(messageData);
-    
+
         if (!this.lastProcessed.has(channelId) || (now - this.lastProcessed.get(channelId)) > this.debounceTime) {
             this.lastProcessed.set(channelId, now);
             this.processDebouncedMessages(channelId);
         }
     }
-    
+
 
     async processDebouncedMessages(channelId) {
         const messages = this.messageCache.get(channelId);
         if (!messages || messages.length === 0) return;
-    
+
         const content = messages.map(m => `${m.username}: ${m.content}`).join('\n');
         const channel = this.client.channels.cache.get(channelId);
-    
+
         // Log the full conversation context being sent to the AI
         console.log('💻 Full conversation context being sent to AI:', content);
-    
+
         if (channel) {
             await this.respondToMessage({ content, location: channel.name }, channel);
         }
-    
+
         this.messageCache.set(channelId, []); // Clear the cache after processing
     }
-    
-    
+
+
     async respondToMessage(data, channel) {
-        const result = await this.chatWithAI(data.content);
-    
+        // get the channel content
+        const channelContent = await channel.messages.fetch({ limit: 10 });
+        const channelMessages = (channelContent.map(m => `${m.author.username}: ${m.content}`).reverse()).join('\n');
+        const fullContext = `You are Codex\n\n${channelMessages}`;
+
+        const decision = await this.chatWithAI(`
+            ${channelMessages}
+            
+        Would codex like to respond to this message? answer with YES or NO, if your response contains the word YES you will be prompted to respond to the message.`);
+        if (!decision.toLowerCase().includes('yes')) {
+            console.log('💻 Codex decided not to respond to the message');
+            console.log(decision);
+            return;
+        }
+
+        console.log('💻 Codex decided to respond to the message');
+        console.log(decision);
+        const result = await this.chatWithAI(fullContext); // Limit the context to 2000 characters
+
         if (result.trim() !== "") {
             console.log('💻 Codex responds:', result);
             await this.sendAsAvatar(result, channel);
@@ -190,7 +188,7 @@ class CodexBot {
         } else {
             console.error('💻 Codex has no response');
         }
-    }    
+    }
 
     async sendAsAvatar(message, channel) {
         if (!channel) {
@@ -290,7 +288,7 @@ class CodexBot {
             return '';
         }
     }
-    
+
 
     logInnerMonologue(message) {
         console.log(`(codex-inner-monologue) self: ${message}`);
@@ -340,7 +338,7 @@ class CodexBot {
             console.error(`💻 Failed to load memory for ${this.avatar.name}:`, error);
         }
     }
-    
+
     async saveMemory() {
         try {
             await this.memoryCollection.updateOne(
@@ -353,43 +351,41 @@ class CodexBot {
             console.error(`💻 Failed to save memory for ${this.avatar.name}:`, error);
         }
     }
-    
 
-    collectSentiment(data) {
-        const { emojis, sentimentScore } = this.extractSentiments(data.content);
+
+    async collectSentiment(data) {
+        const emojis = await this.extractSentiments(data.content);
         if (!this.memory.sentiments[data.author]) {
             this.memory.sentiments[data.author] = [];
         }
-        this.memory.sentiments[data.author].push(...emojis);
-        this.memory.sentimentScore += sentimentScore;
+        this.memory.sentiments[data.author].push(...(emojis || []));
     }
 
     updateMemory(data, response) {
         const conversation = {
-            user: data.author,
+            location: data.location,
             message: data.content,
             response: response,
             timestamp: new Date().toISOString()
         };
-    
+
         console.log('💻 Updating memory with conversation:', conversation);
-    
+
         this.memory.conversations.push(conversation);
-    
+
         if (this.memory.conversations.length > 50) {
             this.memory.conversations.shift();
         }
-    
+
         this.saveMemory();
     }
-    
+
 
     logState() {
         console.log(`💻 Codex State:
         - Home Channel: ${this.homeChannel}
         - Secondary Channel: ${this.secondaryChannel ? this.secondaryChannel : 'None'}
         - Conversations Logged: ${this.memory.conversations.length}
-        - Sentiment Score: ${this.memory.sentimentScore}
         - Current Goal: ${this.memory.goal}`);
     }
 
